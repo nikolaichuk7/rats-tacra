@@ -48,7 +48,7 @@ informative:
   RFC7030: EST
   RFC7519: JWT
   RFC8555: ACMEv2
-  RFC9266:
+  RFC9266: Channel Binding for TLS 1.3
   WIMSE: I-D.ietf-wimse-workload-creds
   CSR-ATTEST: I-D.ietf-lamps-csr-attestation
   INTERACTION-MODELS: I-D.ietf-rats-reference-interaction-models
