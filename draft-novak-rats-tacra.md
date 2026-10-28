@@ -47,6 +47,7 @@ author:
 
 normative:
   RFC9334: RATS
+  RFC9180: HPKE
 
 informative:
   RFC5280: PKIX
@@ -58,6 +59,8 @@ informative:
   INTERACTION-MODELS: I-D.ietf-rats-reference-interaction-models
   ATTESTATION-FRESHNESS: I-D.ietf-lamps-attestation-freshness
   DAA: I-D.ietf-rats-daa
+  HPKE-BIS: I-D.ietf-hpke-hpke
+  HPKE-PQ: I-D.ietf-hpke-pq
   TWISIGCharter:
     target: https://github.com/confidential-computing/governance/blob/main/SIGs/TWI/TWI_Charter.md
     title: Trustworthy Workload Identity (TWI) Special Interest Group - Charter
@@ -323,7 +326,7 @@ Enrollment corresponds to minting new proof-of-possession credentials, and Retri
 In both cases, the associated secrets remain opaque to the CAS at all times (Goal 10) even if the credential, such as an X.509 certificate, is public and can be returned in plaintext.
 
 * Enrollment: the Credential Acquisition Interface generates a CSK and a CSR. The CSR carries CSKpub and, being self-signed, proves possession of CSKpri. The CSR MUST be bound to the Evidence as specified in {{binding}}, so that the Credential Authority can be sure the CSR was produced on the Attester's platform that the Evidence describes. Carrying Evidence inside the CSR ({{CSR-ATTEST}}) does not replace this binding.
-* Retrieval: the Credential Acquisition Interface generates an asymmetric encryption key CEK. CEKpub MUST be bound to the Evidence as specified in {{binding}}. The resulting secrets are encrypted to CEKpub, ensuring that only the Attester in possession of CEKpri can decrypt them.
+* Retrieval: the Credential Acquisition Interface generates an asymmetric encryption key CEK. CEKpub MUST be bound to the Evidence as specified in {{binding}}. The resulting secrets are sealed to CEKpub, so that only the Attester in possession of CEKpri can read them, and the Secret Vault signs the container it releases ({{container}}).
 
 During both Enrollment and Retrieval, the Attester MAY supply a Credential Hint.
 During Enrollment, a Credential Authority MAY use the Credential Hint when assigning a Subject Alternative Name or other certificate properties.
@@ -394,6 +397,31 @@ This binding ties the CSR or CEKpub to the Attester's platform, to the intended 
 It does not by itself tie the exchange to the channel over which the credential is acquired.
 Nor does it cover the Credential Type or the Credential Hint, which the CAS can change; a Relying Party MUST NOT issue or release a credential beyond what its policy allows for the attested context.
 
+## Sealing the Released Credential {#container}
+
+In Retrieval, the Secret Vault releases a credential bundle inside a container sealed to CEKpub ({{binding}}).
+The CAS carries CEKpub and the container, and it is not trusted ({{untrusted-cas}}).
+Sealing alone does not bound it: anyone who saw CEKpub can seal a container to it.
+The container therefore MUST authenticate the Secret Vault as its origin, and the Attester MUST verify that origin before it opens anything.
+
+The construction is as follows. A protocol profile specifies the HPKE suite, the signature algorithm, the labels and the encoding of the container and of its parts.
+
+1. The Secret Vault seals the bundle to CEKpub with HPKE in base mode (Section 5.1.1 of {{RFC9180}}), with the `info` and the associated data below.
+2. `info` is the length-prefixed concatenation, as in {{binding}}, of a label the profile sets, the Target and the freshness element of the request.
+3. The associated data names the credential group, the Target, the freshness element and the Credential Hint of the request, in an encoding the profile sets. The AEAD authenticates it, and the Attester checks that it names what its Evidence bound.
+4. The Secret Vault signs the length-prefixed concatenation of a label the profile sets, the HPKE suite identifier (Section 5.1 of {{RFC9180}}), the name of the signature algorithm, CEKpub as the request carried it, `info`, the associated data, the encapsulated key and the ciphertext. CEKpub among the signed octets ties the signature to one request's key.
+5. The container carries the encapsulated key, the ciphertext, the associated data and the signature, and names its suite.
+
+The Attester, through its Credential Acquisition Interface, holds the Secret Vault's signature key for each Target it retrieves from, as it holds the rest of its configuration (Design Goal 5).
+It MUST refuse a container whose signature does not verify under that key, whose associated data does not name its Target, its freshness element and its Credential Hint, or whose suite is not the one the profile sets.
+A container the CAS sealed itself, or the Secret Vault's container for another request, fails these checks.
+
+A signature, and not an authenticated HPKE mode, because the successor of {{RFC9180}} removes the authenticated modes ({{HPKE-BIS}}), and the post-quantum KEMs have no authenticated encapsulation (Section 7.2 of {{HPKE-PQ}}).
+A signature over the sealed container works with any KEM.
+
+CEKpub travels in the encoding its KEM defines, and those octets are the subject of the binding ({{binding}}): the DER encoding of a SubjectPublicKeyInfo ({{RFC5280}}) for a Diffie-Hellman KEM, and the encapsulation key itself for the KEMs of {{HPKE-PQ}}, which have no SubjectPublicKeyInfo form.
+The CEK is generated for one exchange inside the Attesting Environment and is not reused.
+
 ## Summary of RATS Roles
 
 | TACRA Component | RATS Role | Remarks |
@@ -404,7 +432,7 @@ Nor does it cover the Credential Type or the Credential Hint, which the CAS can 
 | CAAPI Client | Part of Attester | Invoked by CAI to communicate with CAS Client |
 | CAS Client | None: Conduit only | CAS Client extended by Remote Attestation Plug-in; SHOULD be outside the Attester's trust boundary and, wherever it runs, is trusted for nothing beyond carrying messages ({{untrusted-cas}}) |
 | CAS Server | None: Conduit only | CAS Server extended by Remote Attestation Plug-in; forwards Freshness Handles, Evidence, and Attestation Results; does not appraise |
-| Secret Vault | RATS Relying Party | Invoked in the Retrieval variant of this architecture; SHOULD encrypt retrieved results to CEKpub in order to keep it from leaking to the CAS Server |
+| Secret Vault | RATS Relying Party | Invoked in the Retrieval variant of this architecture; seals what it releases to CEKpub and signs the container ({{container}}), so that the CAS Server neither reads nor forges it |
 | Credential Authority | RATS Relying Party | Invoked in the Enrollment variant of this architecture |
 | Verifier | Verifier | No changes in RATS Verifier role or implementation |
 | RATS-Unaware Relying Party | None | No changes in RUP role or implementation |
@@ -586,11 +614,11 @@ What each party holds, and what bounds it:
   * the freshness element;
   * the RATS Relying Party's policy;
   * the Verifiers the RATS Relying Party trusts;
-  * the container sealed to CEKpub.
+  * the container sealed to CEKpub and signed by the Secret Vault ({{container}}).
 * The Verifier holds Reference Values, the hardware vendors' roots and, when it originates them, Freshness Handles.
   It appraises Evidence and reports the freshness input it read. It decides nothing about credential issuance or retrieval.
 * The Credential Authority and the Secret Vault hold the issuance policy, the signing key or the secrets, and the Verifiers they trust.
-  Each recomputes the binding from the request and from what it holds ({{binding}}), and checks the freshness element under the Freshness Kind of its policy. The Secret Vault seals what it releases to CEKpub.
+  Each recomputes the binding from the request and from what it holds ({{binding}}), and checks the freshness element under the Freshness Kind of its policy. The Secret Vault seals what it releases to CEKpub and signs the container ({{container}}).
 
 The various attacks the CAS is capable of and their mitigations are listed below:
 
@@ -611,6 +639,7 @@ The various attacks the CAS is capable of and their mitigations are listed below
   * This document binds no Relying Party identifier ({{binding}}). Binding one would make the second RATS Relying Party refuse every Freshness Kind, including a Freshness Handle it originated itself.
   * As it is, the CAS Server chooses among the RATS Relying Parties that trust the same Verifier and serve that Target name. `present-nonce` keeps one Evidence from serving a second RATS Relying Party, but not the one the CAS Server started the exchange at.
   * A deployment that wants one RATS Relying Party, and no other, to serve a given Attester gives each RATS Relying Party its own Target names. The Target is bound, and a RATS Relying Party refuses a request for a Target it does not serve.
+* Substitution of the response. In Retrieval, the CAS can return a container of its own making, sealed to CEKpub, which it saw in the request, or the Secret Vault's container for another request. The Attester opens only a container the Secret Vault signed for this request ({{container}}), so it obtains nothing from either.
 * The choice of Verifier in the Passport model. The CAS Server chooses the Verifier it sends Evidence to, and relays the Attestation Results.
   A RATS Relying Party MUST accept Attestation Results only from a Verifier it trusts, and MUST check that the freshness input they report equals its own recomputation of the binding ({{binding}}). Any other Verifier chosen by the CAS is therefore of no use to it.
 * What the binding does not cover. The Credential Type and the Credential Hint travel unbound, and a CAS can change them. Two things bound that. The RATS Relying Party's policy issues or releases nothing beyond what it allows for the attested context, whatever the request says. The Attester sees whether the credential it receives is the one it asked for ({{binding}}, {{credential-hint}}, {{credential-scope}}).
@@ -624,7 +653,7 @@ A deployment that cannot accept it encrypts Evidence to the Verifier, which requ
 What the CAS cannot read is CSKpri, CEKpri and the secret the Secret Vault seals to CEKpub.
 
 The CAS Client SHOULD be outside the Attester's trust boundary. Outside it, the CAS Client is not attested as part of the Attester, and this architecture relies on it for nothing beyond carrying messages. Inside it, as when the CAS Client runs in the same Confidential VM, it shares the Attester's environment and can inspect the secrets the Attester generates and the secrets the CAS Server returns. A deployment that runs it there accepts that.
-This architecture leaves open the possibility that the CAS Server retrieves credentials from the Secret Vault in plaintext and itself encrypts them with CEKpub, so that only the Attester can read them. That option is discouraged, since it exposes the secret to the CAS Server.
+A CAS Server that took a credential from the Secret Vault in plaintext and sealed it to CEKpub itself would expose the secret to the CAS Server, and could not produce the Secret Vault's signature ({{container}}). This architecture does not permit that variant: the Secret Vault seals and signs what it releases (Design Goal 10).
 
 A compromised platform attestation key breaks every guarantee above. The Verifier's defences are the vendor's root, which the key must chain to, and the TCB level the Evidence reports, which the Verifier's policy can require to be current.
 Under `absent-timestamp`, Evidence carries the current value of the Attester's clock, and its freshness is only as good as that clock ({{freshness-kind}}).
